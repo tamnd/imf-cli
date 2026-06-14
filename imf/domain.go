@@ -2,7 +2,6 @@ package imf
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -19,9 +18,6 @@ import (
 // imf:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone imf binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the imf driver. It carries no state; the per-run client is
@@ -36,10 +32,10 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "imf",
-			Short:  "A command line for imf.",
-			Long: `A command line for imf.
+			Short:  "A command line for the IMF DataMapper API.",
+			Long: `A command line for the IMF DataMapper API.
 
-imf reads public imf data over plain HTTPS, shapes it into
+imf reads public IMF economic data over plain HTTPS, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
 key, nothing to run alongside it.`,
 			Site: Host,
@@ -48,28 +44,62 @@ key, nothing to run alongside it.`,
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `imf page` and
-	// `ant get imf://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// indicator: fetch one indicator by code (resolver, seeds the mint index).
+	kit.Handle(app, kit.OpMeta{
+		Name:     "indicator",
+		Group:    "read",
+		Single:   true,
+		Resolver: true,
+		Summary:  "Fetch one indicator by code",
+		URIType:  "indicator",
+		Args:     []kit.Arg{{Name: "code", Help: "indicator code e.g. NGDP_RPCH"}},
+	}, getIndicator)
 
-	// List op: members of a page, the home of `imf links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// imf://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// indicators: list all available indicator codes and metadata.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "indicators",
+		Group:   "read",
+		List:    true,
+		Summary: "List all IMF indicators",
+		URIType: "indicator",
+	}, listIndicators)
+
+	// country: fetch one country by code (resolver, seeds the mint index).
+	kit.Handle(app, kit.OpMeta{
+		Name:     "country",
+		Group:    "read",
+		Single:   true,
+		Resolver: true,
+		Summary:  "Fetch one country by code",
+		URIType:  "country",
+		Args:     []kit.Arg{{Name: "code", Help: "country ISO3 code e.g. USA"}},
+	}, getCountry)
+
+	// countries: list all country/region codes and labels.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "countries",
+		Group:   "read",
+		List:    true,
+		Summary: "List all IMF countries and regions",
+		URIType: "country",
+	}, listCountries)
+
+	// data: fetch data points for a given indicator, optionally filtered by country and year range.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "data",
+		Group:   "read",
+		List:    true,
+		Summary: "Fetch data points for an indicator",
+		URIType: "data",
+		Args:    []kit.Arg{{Name: "indicator", Help: "indicator code e.g. NGDP_RPCH"}},
+	}, fetchData)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,86 +118,168 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type indicatorInput struct {
+	Code   string  `kit:"arg" help:"indicator code e.g. NGDP_RPCH"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type indicatorsInput struct {
+	Limit  int     `kit:"flag,inherit"`
 	Client *Client `kit:"inject"`
+}
+
+type countryInput struct {
+	Code   string  `kit:"arg" help:"country ISO3 code e.g. USA"`
+	Client *Client `kit:"inject"`
+}
+
+type countriesInput struct {
+	Limit  int     `kit:"flag,inherit"`
+	Client *Client `kit:"inject"`
+}
+
+type dataInput struct {
+	Indicator string  `kit:"arg" help:"indicator code e.g. NGDP_RPCH"`
+	Country   string  `kit:"flag" help:"country ISO3 code e.g. USA (omit for all countries)"`
+	Periods   string  `kit:"flag" help:"comma-separated years e.g. 2020,2021,2022"`
+	Client    *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func getIndicator(ctx context.Context, in indicatorInput, emit func(*Indicator) error) error {
+	items, err := in.Client.ListIndicators(ctx)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	for _, item := range items {
+		if item.ID == in.Code {
+			return emit(item)
+		}
+	}
+	return errs.NotFound("indicator %q not found", in.Code)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func listIndicators(ctx context.Context, in indicatorsInput, emit func(*Indicator) error) error {
+	items, err := in.Client.ListIndicators(ctx)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i, item := range items {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(item); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full imf.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized imf reference: %q", input)
+func getCountry(ctx context.Context, in countryInput, emit func(*Country) error) error {
+	items, err := in.Client.ListCountries(ctx)
+	if err != nil {
+		return mapErr(err)
 	}
-	return "page", id, nil
+	for _, item := range items {
+		if item.Code == in.Code {
+			return emit(item)
+		}
+	}
+	return errs.NotFound("country %q not found", in.Code)
+}
+
+func listCountries(ctx context.Context, in countriesInput, emit func(*Country) error) error {
+	items, err := in.Client.ListCountries(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i, item := range items {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func fetchData(ctx context.Context, in dataInput, emit func(*DataPoint) error) error {
+	points, err := in.Client.FetchData(ctx, in.Indicator, in.Country, in.Periods)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, pt := range points {
+		if err := emit(pt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver: URI driver string functions, pure and network-free ---
+
+// Classify turns any accepted input into the canonical (type, id).
+// Uppercase codes like "NGDP_RPCH" are indicators; 3-letter uppercase codes
+// like "USA" are countries.
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty IMF reference")
+	}
+	// 3-letter all-uppercase: country code
+	if len(input) == 3 && input == strings.ToUpper(input) && isAlpha(input) {
+		return "country", input, nil
+	}
+	// Uppercase with underscores: indicator code
+	if input == strings.ToUpper(input) && containsUnderscore(input) {
+		return "indicator", input, nil
+	}
+	// Bare uppercase code without underscore (e.g. "BCA")
+	if input == strings.ToUpper(input) && isAlphaNum(input) {
+		return "indicator", input, nil
+	}
+	return "", "", errs.Usage("unrecognized IMF reference: %q", input)
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "indicator":
+		return "https://" + Host + "/external/datamapper/" + id, nil
+	case "country":
+		return "https://" + Host + "/en/Countries/" + id + "/", nil
+	default:
 		return "", errs.Usage("imf has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
 func mapErr(err error) error {
 	return err
+}
+
+func isAlpha(s string) bool {
+	for _, r := range s {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+func isAlphaNum(s string) bool {
+	for _, r := range s {
+		if !((r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsUnderscore(s string) bool {
+	return strings.ContainsRune(s, '_')
 }

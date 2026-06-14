@@ -1,5 +1,5 @@
 // Package imf is the library behind the imf command line:
-// the HTTP client, request shaping, and the typed data models for imf.
+// the HTTP client, request shaping, and the typed data models for the IMF DataMapper API.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
@@ -9,27 +9,24 @@ package imf
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"sort"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to imf. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "imf/dev (+https://github.com/tamnd/imf-cli)"
+// DefaultUserAgent identifies the client to the IMF API.
+const DefaultUserAgent = "imf-cli/dev (+https://github.com/tamnd/imf-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at imf.com; change it once you
-// know the real endpoints you want to read.
-const Host = "imf.com"
+// Host is the site this client talks to.
+const Host = "www.imf.org"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://" + Host + "/external/datamapper/api/v1"
 
-// Client talks to imf over HTTP.
+// Client talks to the IMF DataMapper API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,13 +37,13 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: a 30s timeout, a 500ms
+// minimum gap between requests (IMF is picky), and five retries on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
+		Rate:      500 * time.Millisecond,
 		Retries:   5,
 	}
 }
@@ -123,78 +120,155 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on imf.com. It is a stand-in for the typed records you
-// will model from the real imf endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `imf cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- typed output records ---
+
+// Indicator is one IMF data series, e.g. "Real GDP growth" (NGDP_RPCH).
+type Indicator struct {
+	ID          string `kit:"id" json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	Source      string `json:"source"`
+	Unit        string `json:"unit"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// Country is one IMF country/region entry.
+type Country struct {
+	Code  string `kit:"id" json:"code"`
+	Label string `json:"label"`
+}
+
+// DataPoint is one value: the reading for a given indicator, country and year.
+type DataPoint struct {
+	Indicator string  `kit:"id" json:"indicator"`
+	Country   string  `json:"country"`
+	Year      string  `json:"year"`
+	Value     float64 `json:"value"`
+}
+
+// --- API calls ---
+
+// indicatorsResp is the raw JSON envelope from /indicators.
+type indicatorsResp struct {
+	Indicators map[string]struct {
+		Label       string `json:"label"`
+		Description string `json:"description"`
+		Source      string `json:"source"`
+		Unit        string `json:"unit"`
+	} `json:"indicators"`
+}
+
+// ListIndicators fetches all available indicator codes and their metadata.
+func (c *Client) ListIndicators(ctx context.Context) ([]*Indicator, error) {
+	body, err := c.Get(ctx, BaseURL+"/indicators")
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+	var resp indicatorsResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode indicators: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	// Collect and sort alphabetically by ID for stable output.
+	ids := make([]string, 0, len(resp.Indicators))
+	for id := range resp.Indicators {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	out := make([]*Indicator, 0, len(ids))
+	for _, id := range ids {
+		m := resp.Indicators[id]
+		out = append(out, &Indicator{
+			ID:          id,
+			Label:       m.Label,
+			Description: m.Description,
+			Source:      m.Source,
+			Unit:        m.Unit,
+		})
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// countriesResp is the raw JSON envelope from /countries.
+type countriesResp struct {
+	Countries map[string]struct {
+		Label string `json:"label"`
+	} `json:"countries"`
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// ListCountries fetches all country/region codes and labels.
+func (c *Client) ListCountries(ctx context.Context) ([]*Country, error) {
+	body, err := c.Get(ctx, BaseURL+"/countries")
+	if err != nil {
+		return nil, err
 	}
-	return s
+	var resp countriesResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode countries: %w", err)
+	}
+	codes := make([]string, 0, len(resp.Countries))
+	for code := range resp.Countries {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+
+	out := make([]*Country, 0, len(codes))
+	for _, code := range codes {
+		out = append(out, &Country{Code: code, Label: resp.Countries[code].Label})
+	}
+	return out, nil
+}
+
+// dataResp is the raw JSON envelope from /INDICATOR or /INDICATOR/COUNTRY.
+type dataResp struct {
+	Values map[string]map[string]map[string]float64 `json:"values"`
+}
+
+// FetchData fetches data points for indicator. If country is non-empty, only
+// that country's data is fetched. periods is an optional comma-separated list
+// of years to filter by (appended as ?periods=...).
+func (c *Client) FetchData(ctx context.Context, indicator, country, periods string) ([]*DataPoint, error) {
+	u := BaseURL + "/" + indicator
+	if country != "" {
+		u += "/" + country
+	}
+	if periods != "" {
+		u += "?periods=" + periods
+	}
+
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp dataResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode data: %w", err)
+	}
+
+	// values: { "NGDP_RPCH": { "USA": { "2020": -2.1, ... }, ... } }
+	var out []*DataPoint
+	for indCode, countriesMap := range resp.Values {
+		for cCode, yearsMap := range countriesMap {
+			years := make([]string, 0, len(yearsMap))
+			for yr := range yearsMap {
+				years = append(years, yr)
+			}
+			sort.Strings(years)
+			for _, yr := range years {
+				out = append(out, &DataPoint{
+					Indicator: indCode,
+					Country:   cCode,
+					Year:      yr,
+					Value:     yearsMap[yr],
+				})
+			}
+		}
+	}
+	// Sort: by country then year for stable, readable output.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Country != out[j].Country {
+			return out[i].Country < out[j].Country
+		}
+		return out[i].Year < out[j].Year
+	})
+	return out, nil
 }
